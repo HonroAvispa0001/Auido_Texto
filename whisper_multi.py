@@ -19,6 +19,7 @@ import sys
 import json
 import threading
 import re
+import logging
 from pathlib import Path
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -26,21 +27,30 @@ from typing import Optional, Callable, List
 import customtkinter as ctk
 from tkinter import filedialog, messagebox
 
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
 # Try to import OpenAI
 try:
     from openai import OpenAI
     OPENAI_AVAILABLE = True
-except ImportError:
+    logger.info("OpenAI package loaded successfully")
+except ImportError as e:
     OPENAI_AVAILABLE = False
-    print("WARNING: openai package not installed. Run: pip install openai")
+    logger.warning("OpenAI package not installed. Run: pip install openai")
 
 # Try to import TkinterDnD for drag-drop support
 try:
     from tkinterdnd2 import DND_FILES, TkinterDnD
     DND_AVAILABLE = True
-except ImportError:
+    logger.info("TkinterDnD2 package loaded successfully")
+except ImportError as e:
     DND_AVAILABLE = False
-    print("INFO: tkinterdnd2 not available. Drag-drop disabled. Install with: pip install tkinterdnd2")
+    logger.info("TkinterDnD2 not available. Drag-drop disabled. Install with: pip install tkinterdnd2")
 
 # ============================================================================
 # CONFIGURATION
@@ -123,9 +133,10 @@ class ConfigManager:
             try:
                 with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                     loaded = json.load(f)
+                    logger.info("Configuration loaded successfully")
                     return {**self.DEFAULT_CONFIG, **loaded}
-            except (json.JSONDecodeError, IOError):
-                pass
+            except (json.JSONDecodeError, IOError) as e:
+                logger.error(f"Failed to load config: {e}")
         return self.DEFAULT_CONFIG.copy()
 
     def save(self):
@@ -133,8 +144,10 @@ class ConfigManager:
         try:
             with open(CONFIG_FILE, "w", encoding="utf-8") as f:
                 json.dump(self.config, f, indent=2)
+            logger.info("Configuration saved successfully")
         except IOError as e:
-            print(f"Error saving config: {e}")
+            logger.error(f"Error saving config: {e}")
+            messagebox.showerror("Save Error", f"Failed to save settings: {e}")
 
     def get(self, key: str, default=None):
         return self.config.get(key, default)
@@ -155,8 +168,17 @@ class TranscriptionEngine:
 
     def __init__(self, api_key: str):
         if not OPENAI_AVAILABLE:
+            logger.error("OpenAI package not installed")
             raise ImportError("OpenAI package not installed")
-        self.client = OpenAI(api_key=api_key)
+        if not api_key or not api_key.strip():
+            logger.error("Invalid API key provided")
+            raise ValueError("API key is required")
+        try:
+            self.client = OpenAI(api_key=api_key)
+            logger.info("OpenAI client initialized successfully")
+        except Exception as e:
+            logger.error(f"Failed to initialize OpenAI client: {e}")
+            raise
 
     def transcribe(
         self,
@@ -186,9 +208,12 @@ class TranscriptionEngine:
         try:
             file_size = os.path.getsize(file_path)
             if file_size > self.MAX_FILE_SIZE:
-                result["error"] = f"File too large ({file_size / 1024 / 1024:.1f} MB). Max: 25 MB"
+                error_msg = f"File too large ({file_size / 1024 / 1024:.1f} MB). Max: 25 MB"
+                result["error"] = error_msg
+                logger.warning(f"{error_msg}: {file_path}")
                 return result
 
+            logger.info(f"Starting transcription: {file_path}")
             if progress_callback:
                 progress_callback("uploading", 0.3)
 
@@ -215,9 +240,11 @@ class TranscriptionEngine:
             result["text"] = response.text
             result["duration"] = getattr(response, "duration", 0)
             result["language"] = getattr(response, "language", "unknown")
+            logger.info(f"Transcription completed: {file_path}")
 
         except Exception as e:
             error_msg = str(e)
+            logger.error(f"Transcription error for {file_path}: {error_msg}")
             # Provide more helpful error messages
             if "invalid_api_key" in error_msg.lower() or "401" in error_msg:
                 result["error"] = "Invalid API key. Check settings."
@@ -225,6 +252,8 @@ class TranscriptionEngine:
                 result["error"] = "Rate limited. Wait and retry."
             elif "insufficient_quota" in error_msg.lower():
                 result["error"] = "Insufficient quota. Check OpenAI billing."
+            elif "connection" in error_msg.lower() or "network" in error_msg.lower():
+                result["error"] = "Network error. Check connection."
             else:
                 result["error"] = error_msg[:100]  # Truncate long errors
 
@@ -283,6 +312,12 @@ class ProcessingManager:
                 if not any(item.file_path == path for item in self.queue):
                     self.queue.append(FileQueueItem(path))
                     added += 1
+                    logger.debug(f"Added to queue: {path}")
+                else:
+                    logger.debug(f"Duplicate file skipped: {path}")
+            else:
+                logger.warning(f"Unsupported or invalid file: {path}")
+        logger.info(f"Added {added} file(s) to queue")
         return added
 
     def remove_file(self, index: int):
@@ -307,22 +342,27 @@ class ProcessingManager:
     def start_processing(self):
         """Start processing the queue."""
         if self.is_processing:
+            logger.warning("Processing already in progress")
             return
 
         if not OPENAI_AVAILABLE:
+            logger.error("OpenAI package not installed")
             raise ValueError("OpenAI package not installed. Run: pip install openai")
 
         api_key = self.config.get("api_key", "").strip()
         if not api_key:
+            logger.error("API key not configured")
             raise ValueError("API key not configured. Click Settings to add your OpenAI API key.")
 
         pending = [item for item in self.queue if item.status == FileQueueItem.STATUS_PENDING]
         if not pending:
+            logger.warning("No files to process")
             raise ValueError("No files to process")
 
         self.is_processing = True
         self.is_paused = False
         self._stop_event.clear()
+        logger.info(f"Starting processing of {len(pending)} file(s)")
 
         thread = threading.Thread(target=self._process_queue, daemon=True)
         thread.start()
@@ -345,7 +385,10 @@ class ProcessingManager:
         try:
             engine = TranscriptionEngine(api_key)
         except Exception as e:
+            logger.error(f"Failed to initialize transcription engine: {e}")
             self.is_processing = False
+            if self.completion_callback:
+                self.completion_callback()
             return
 
         max_workers = self.config.get("max_workers", 3)
@@ -383,6 +426,8 @@ class ProcessingManager:
                 self._notify_update()
 
         self.is_processing = False
+        stats = self.get_stats()
+        logger.info(f"Processing completed. Stats: {stats}")
         if self.completion_callback:
             self.completion_callback()
 
@@ -440,18 +485,23 @@ class ProcessingManager:
             output_path = os.path.join(output_dir, f"{base_name}_transcript_{counter}.{output_format}")
             counter += 1
 
-        with open(output_path, "w", encoding="utf-8") as f:
-            if output_format == "json":
-                json.dump({
-                    "source_file": item.file_path,
-                    "transcription": text,
-                    "timestamp": datetime.now().isoformat(),
-                    "duration": item.duration,
-                }, f, ensure_ascii=False, indent=2)
-            else:
-                f.write(text)
+        try:
+            with open(output_path, "w", encoding="utf-8") as f:
+                if output_format == "json":
+                    json.dump({
+                        "source_file": item.file_path,
+                        "transcription": text,
+                        "timestamp": datetime.now().isoformat(),
+                        "duration": item.duration,
+                    }, f, ensure_ascii=False, indent=2)
+                else:
+                    f.write(text)
 
-        item.output_path = output_path
+            item.output_path = output_path
+            logger.info(f"Transcription saved: {output_path}")
+        except Exception as e:
+            logger.error(f"Failed to save transcription: {e}")
+            raise
 
     def _notify_update(self):
         """Notify the UI of an update."""
@@ -595,9 +645,18 @@ class FileListItem(ctk.CTkFrame):
 # Create the appropriate base class based on DnD availability
 if DND_AVAILABLE:
     class BaseApp(ctk.CTk, TkinterDnD.DnDWrapper):
-        TkdndVersion = TkinterDnD._require(None)
+        """Base application with drag-and-drop support."""
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            # Initialize TkinterDnD properly
+            try:
+                self.TkdndVersion = TkinterDnD._require(self)
+                logger.info(f"TkinterDnD initialized: {self.TkdndVersion}")
+            except Exception as e:
+                logger.error(f"Failed to initialize TkinterDnD: {e}")
 else:
     class BaseApp(ctk.CTk):
+        """Base application without drag-and-drop."""
         pass
 
 
@@ -639,8 +698,13 @@ class WhisperTranscriptor(BaseApp):
             try:
                 self.drop_target_register(DND_FILES)
                 self.dnd_bind('<<Drop>>', self._on_drop)
+                logger.info("Drag-and-drop enabled")
             except Exception as e:
-                print(f"Drag-drop setup failed: {e}")
+                logger.error(f"Drag-drop setup failed: {e}")
+                messagebox.showwarning(
+                    "Drag-Drop Warning",
+                    "Drag-and-drop initialization failed. You can still use 'Add Files' button."
+                )
 
         # File list widgets cache
         self.file_widgets: List[FileListItem] = []
@@ -1030,12 +1094,23 @@ class WhisperTranscriptor(BaseApp):
 
     def _save_settings(self):
         """Save settings to config."""
-        self.config.set("api_key", self.api_key_entry.get().strip())
+        api_key = self.api_key_entry.get().strip()
+        
+        # Basic API key validation
+        if api_key and not api_key.startswith("sk-"):
+            messagebox.showwarning(
+                "Invalid API Key",
+                "OpenAI API keys typically start with 'sk-'. Please verify your key."
+            )
+            return
+        
+        self.config.set("api_key", api_key)
         self.config.set("output_dir", self.output_dir_entry.get().strip())
         self.config.set("max_workers", int(self.workers_slider.get()))
         self.config.set("language", self.language_var.get())
         self.config.set("output_format", self.format_var.get())
 
+        logger.info("Settings saved")
         self._toggle_settings()
         self._show_notification("Settings saved successfully!")
 
