@@ -9,3 +9,28 @@ customtkinter>=5.2.0
 tkinterdnd2>=0.3.0
 
 # Note: tkinter comes with Python installation
+# ============================================================================
+# EXTERNAL DEPENDENCIES (not pip packages)
+# ============================================================================
+# 
+# FFmpeg (HIGHLY RECOMMENDED)
+# ---------------------------
+# Required for: MP4 to MP3 conversion, file splitting for large files
+# 
+# Installation:
+#   Windows: 
+#     1. Download from https://ffmpeg.org/download.html
+#     2. Or use: winget install FFmpeg
+#     3. Or use: choco install ffmpeg
+#   
+#   macOS:
+#     brew install ffmpeg
+#   
+#   Linux:
+#     sudo apt install ffmpeg  (Ubuntu/Debian)
+#     sudo dnf install ffmpeg  (Fedora)
+#
+# Without FFmpeg:
+#   - MP4 and other video files won't be optimized (higher API costs)
+#   - Files larger than 25MB cannot be processed
+#

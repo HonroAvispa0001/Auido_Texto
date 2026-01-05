@@ -20,10 +20,13 @@ import json
 import threading
 import re
 import logging
+import subprocess
+import tempfile
+import shutil
 from pathlib import Path
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Optional, Callable, List
+from typing import Optional, Callable, List, Tuple
 import customtkinter as ctk
 from tkinter import filedialog, messagebox
 
@@ -51,6 +54,26 @@ try:
 except ImportError as e:
     DND_AVAILABLE = False
     logger.info("TkinterDnD2 not available. Drag-drop disabled. Install with: pip install tkinterdnd2")
+
+# Check for FFmpeg availability
+def check_ffmpeg() -> bool:
+    """Check if FFmpeg is available in the system."""
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-version"],
+            capture_output=True,
+            text=True,
+            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+        )
+        return result.returncode == 0
+    except (FileNotFoundError, Exception):
+        return False
+
+FFMPEG_AVAILABLE = check_ffmpeg()
+if FFMPEG_AVAILABLE:
+    logger.info("FFmpeg found - audio preprocessing enabled")
+else:
+    logger.warning("FFmpeg not found. Install FFmpeg for MP4 conversion and file splitting. https://ffmpeg.org/download.html")
 
 # ============================================================================
 # CONFIGURATION
@@ -105,6 +128,335 @@ COLORS = {
     "text": "#ffffff",
     "text_secondary": "#a0a0a0",
 }
+
+# Formats that need conversion to MP3 for cost optimization
+FORMATS_TO_CONVERT = {".mp4", ".webm", ".mpeg", ".wav", ".flac", ".aiff", ".aif", ".wma"}
+
+# ============================================================================
+# AUDIO PREPROCESSOR
+# ============================================================================
+
+class AudioPreprocessor:
+    """
+    Handles audio preprocessing: format conversion and file splitting.
+    
+    - Converts video formats (MP4, WebM) to optimized MP3
+    - Splits large files (>24MB) into chunks for API compliance
+    - Uses FFmpeg for all processing
+    """
+    
+    # Target size slightly under 25MB limit for safety margin
+    MAX_CHUNK_SIZE = 24 * 1024 * 1024  # 24 MB
+    
+    # Optimal audio settings for Whisper (good quality, small size)
+    # 64kbps mono is sufficient for speech recognition
+    AUDIO_BITRATE = "64k"
+    AUDIO_CHANNELS = 1
+    AUDIO_SAMPLE_RATE = 16000  # Whisper's native sample rate
+    
+    def __init__(self, temp_dir: Optional[str] = None):
+        """
+        Initialize the preprocessor.
+        
+        Args:
+            temp_dir: Directory for temporary files. If None, uses system temp.
+        """
+        self.temp_dir = temp_dir or tempfile.mkdtemp(prefix="whisper_")
+        os.makedirs(self.temp_dir, exist_ok=True)
+        self._temp_files: List[str] = []
+        logger.info(f"AudioPreprocessor initialized. Temp dir: {self.temp_dir}")
+    
+    def needs_conversion(self, file_path: str) -> bool:
+        """Check if a file needs format conversion."""
+        ext = Path(file_path).suffix.lower()
+        return ext in FORMATS_TO_CONVERT
+    
+    def needs_splitting(self, file_path: str) -> bool:
+        """Check if a file needs to be split due to size."""
+        try:
+            return os.path.getsize(file_path) > self.MAX_CHUNK_SIZE
+        except OSError:
+            return False
+    
+    def get_audio_duration(self, file_path: str) -> float:
+        """Get the duration of an audio file in seconds using FFprobe."""
+        try:
+            cmd = [
+                "ffprobe",
+                "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                file_path
+            ]
+            
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+            )
+            
+            if result.returncode == 0:
+                return float(result.stdout.strip())
+        except Exception as e:
+            logger.error(f"Failed to get audio duration: {e}")
+        
+        return 0.0
+    
+    def convert_to_optimized_mp3(
+        self, 
+        file_path: str, 
+        progress_callback: Optional[Callable] = None
+    ) -> str:
+        """
+        Convert a file to optimized MP3 format.
+        
+        Args:
+            file_path: Path to the input file
+            progress_callback: Optional callback for progress updates
+            
+        Returns:
+            Path to the converted MP3 file
+        """
+        if not FFMPEG_AVAILABLE:
+            logger.warning("FFmpeg not available, returning original file")
+            return file_path
+        
+        base_name = Path(file_path).stem
+        output_path = os.path.join(self.temp_dir, f"{base_name}_converted.mp3")
+        
+        logger.info(f"Converting to optimized MP3: {file_path}")
+        
+        if progress_callback:
+            progress_callback("converting", 0.1)
+        
+        cmd = [
+            "ffmpeg",
+            "-y",  # Overwrite output
+            "-i", file_path,
+            "-vn",  # No video
+            "-acodec", "libmp3lame",
+            "-ab", self.AUDIO_BITRATE,
+            "-ar", str(self.AUDIO_SAMPLE_RATE),
+            "-ac", str(self.AUDIO_CHANNELS),
+            "-map_metadata", "-1",  # Remove metadata to reduce size
+            output_path
+        ]
+        
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+            )
+            
+            if result.returncode != 0:
+                logger.error(f"FFmpeg conversion failed: {result.stderr}")
+                raise RuntimeError(f"Conversion failed: {result.stderr[:200]}")
+            
+            self._temp_files.append(output_path)
+            
+            original_size = os.path.getsize(file_path)
+            new_size = os.path.getsize(output_path)
+            reduction = (1 - new_size / original_size) * 100
+            
+            logger.info(f"Conversion complete: {original_size/1024/1024:.1f}MB -> {new_size/1024/1024:.1f}MB ({reduction:.1f}% reduction)")
+            
+            if progress_callback:
+                progress_callback("converted", 0.2)
+            
+            return output_path
+            
+        except Exception as e:
+            logger.error(f"Failed to convert file: {e}")
+            raise
+    
+    def split_audio(
+        self, 
+        file_path: str, 
+        progress_callback: Optional[Callable] = None
+    ) -> List[str]:
+        """
+        Split a large audio file into smaller chunks.
+        
+        Args:
+            file_path: Path to the input file
+            progress_callback: Optional callback for progress updates
+            
+        Returns:
+            List of paths to the chunk files
+        """
+        if not FFMPEG_AVAILABLE:
+            logger.warning("FFmpeg not available, returning original file")
+            return [file_path]
+        
+        file_size = os.path.getsize(file_path)
+        duration = self.get_audio_duration(file_path)
+        
+        if duration <= 0:
+            logger.error("Could not determine audio duration for splitting")
+            return [file_path]
+        
+        # Calculate chunk duration based on target size
+        # Using bitrate to estimate: size = bitrate * duration
+        # For 64kbps: 24MB = 64000 * duration / 8 -> duration = 24MB * 8 / 64000 = ~3000 seconds
+        # But we'll be more conservative and use actual file size ratio
+        bytes_per_second = file_size / duration
+        chunk_duration = int(self.MAX_CHUNK_SIZE / bytes_per_second * 0.85)  # 85% for safety margin
+        
+        # Minimum 60 seconds, maximum 20 minutes per chunk
+        chunk_duration = max(60, min(chunk_duration, 1200))
+        
+        # Add small overlap to avoid cutting words (2 seconds)
+        overlap = 2
+        
+        num_chunks = int(duration / (chunk_duration - overlap)) + 1
+        logger.info(f"Splitting {file_path} (duration={duration:.1f}s) into ~{num_chunks} chunks of {chunk_duration}s each")
+        
+        if progress_callback:
+            progress_callback("splitting", 0.1)
+        
+        base_name = Path(file_path).stem
+        chunks = []
+        
+        for i in range(num_chunks):
+            # Calculate start time with overlap consideration
+            if i == 0:
+                start_time = 0
+            else:
+                start_time = i * (chunk_duration - overlap)
+            
+            # Check if we've passed the duration
+            if start_time >= duration:
+                break
+            
+            # Calculate actual duration for this chunk (might be shorter for last chunk)
+            actual_duration = min(chunk_duration, duration - start_time)
+            
+            # Skip if chunk would be too short (less than 1 second)
+            if actual_duration < 1:
+                break
+            
+            chunk_path = os.path.join(self.temp_dir, f"{base_name}_part{i+1:03d}.mp3")
+            
+            # Use -ss BEFORE -i for fast seeking (input seeking)
+            # This is much faster and more accurate for large files
+            cmd = [
+                "ffmpeg",
+                "-y",
+                "-ss", str(start_time),  # Input seeking (fast)
+                "-i", file_path,
+                "-t", str(actual_duration),
+                "-vn",
+                "-acodec", "libmp3lame",
+                "-ab", self.AUDIO_BITRATE,
+                "-ar", str(self.AUDIO_SAMPLE_RATE),
+                "-ac", str(self.AUDIO_CHANNELS),
+                "-avoid_negative_ts", "make_zero",  # Fix timestamp issues
+                chunk_path
+            ]
+            
+            logger.debug(f"Creating chunk {i+1}: start={start_time}s, duration={actual_duration}s")
+            
+            try:
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+                )
+                
+                if result.returncode != 0:
+                    logger.error(f"FFmpeg split failed for chunk {i+1}: {result.stderr[:500]}")
+                    # Don't continue silently - this is a problem
+                    raise RuntimeError(f"Failed to create chunk {i+1}: FFmpeg error")
+                
+                # Verify chunk was created and has content
+                if os.path.exists(chunk_path):
+                    chunk_size = os.path.getsize(chunk_path)
+                    if chunk_size > 1000:
+                        chunks.append(chunk_path)
+                        self._temp_files.append(chunk_path)
+                        logger.info(f"✓ Chunk {i+1}/{num_chunks} created: {chunk_size/1024:.1f}KB, start={start_time}s")
+                        
+                        if progress_callback:
+                            progress = 0.1 + (0.2 * (i + 1) / num_chunks)
+                            progress_callback("splitting", progress)
+                    else:
+                        logger.warning(f"Chunk {i+1} too small ({chunk_size} bytes), skipping")
+                else:
+                    logger.error(f"Chunk {i+1} file was not created: {chunk_path}")
+                        
+            except Exception as e:
+                logger.error(f"Failed to create chunk {i+1}: {e}")
+                raise  # Re-raise to signal failure
+        
+        if not chunks:
+            logger.error("No chunks were created successfully!")
+            return [file_path]
+        
+        logger.info(f"Split complete: {len(chunks)} chunks created from {duration:.1f}s audio")
+        return chunks
+    
+    def preprocess(
+        self, 
+        file_path: str, 
+        progress_callback: Optional[Callable] = None
+    ) -> Tuple[List[str], bool]:
+        """
+        Preprocess an audio file: convert and/or split as needed.
+        
+        Args:
+            file_path: Path to the input file
+            progress_callback: Optional callback for progress updates
+            
+        Returns:
+            Tuple of (list of file paths to process, whether preprocessing was done)
+        """
+        if not FFMPEG_AVAILABLE:
+            return [file_path], False
+        
+        processed_path = file_path
+        was_processed = False
+        
+        # Step 1: Convert if needed
+        if self.needs_conversion(file_path):
+            logger.info(f"File needs conversion: {file_path}")
+            processed_path = self.convert_to_optimized_mp3(file_path, progress_callback)
+            was_processed = True
+        
+        # Step 2: Check if splitting is needed (after conversion)
+        if self.needs_splitting(processed_path):
+            logger.info(f"File needs splitting: {processed_path}")
+            chunks = self.split_audio(processed_path, progress_callback)
+            return chunks, True
+        
+        return [processed_path], was_processed
+    
+    def cleanup(self):
+        """Remove all temporary files created during preprocessing."""
+        for file_path in self._temp_files:
+            try:
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+                    logger.debug(f"Cleaned up temp file: {file_path}")
+            except Exception as e:
+                logger.warning(f"Failed to clean up {file_path}: {e}")
+        
+        self._temp_files.clear()
+        
+        # Try to remove temp directory if empty
+        try:
+            if os.path.exists(self.temp_dir) and not os.listdir(self.temp_dir):
+                os.rmdir(self.temp_dir)
+        except Exception:
+            pass
+    
+    def __del__(self):
+        """Cleanup on deletion."""
+        self.cleanup()
+
 
 # ============================================================================
 # CONFIGURATION MANAGER
@@ -267,6 +619,7 @@ class FileQueueItem:
     """Represents a file in the processing queue."""
 
     STATUS_PENDING = "pending"
+    STATUS_PREPROCESSING = "preprocessing"
     STATUS_PROCESSING = "processing"
     STATUS_COMPLETE = "complete"
     STATUS_ERROR = "error"
@@ -282,6 +635,10 @@ class FileQueueItem:
         self.result_text = ""
         self.output_path = ""
         self.duration = 0
+        # Preprocessing info
+        self.was_preprocessed = False
+        self.chunk_count = 0
+        self.chunks_completed = 0
 
 # ============================================================================
 # PROCESSING MANAGER
@@ -297,6 +654,8 @@ class ProcessingManager:
         self.is_paused = False
         self.update_callback: Optional[Callable] = None
         self.completion_callback: Optional[Callable] = None
+        self._stop_event = threading.Event()
+        self._preprocessor: Optional[AudioPreprocessor] = None
         self._stop_event = threading.Event()
 
     def add_files(self, file_paths: List[str]) -> int:
@@ -375,8 +734,13 @@ class ProcessingManager:
 
         # Mark processing items as cancelled
         for item in self.queue:
-            if item.status == FileQueueItem.STATUS_PROCESSING:
+            if item.status in (FileQueueItem.STATUS_PROCESSING, FileQueueItem.STATUS_PREPROCESSING):
                 item.status = FileQueueItem.STATUS_CANCELLED
+        
+        # Cleanup preprocessor
+        if self._preprocessor:
+            self._preprocessor.cleanup()
+            self._preprocessor = None
 
     def _process_queue(self):
         """Internal method to process the queue."""
@@ -390,6 +754,9 @@ class ProcessingManager:
             if self.completion_callback:
                 self.completion_callback()
             return
+        
+        # Initialize preprocessor for this batch
+        self._preprocessor = AudioPreprocessor()
 
         max_workers = self.config.get("max_workers", 3)
 
@@ -425,6 +792,11 @@ class ProcessingManager:
 
                 self._notify_update()
 
+        # Cleanup preprocessor temp files
+        if self._preprocessor:
+            self._preprocessor.cleanup()
+            self._preprocessor = None
+
         self.is_processing = False
         stats = self.get_stats()
         logger.info(f"Processing completed. Stats: {stats}")
@@ -432,7 +804,7 @@ class ProcessingManager:
             self.completion_callback()
 
     def _process_single_file(self, engine: TranscriptionEngine, item: FileQueueItem):
-        """Process a single file."""
+        """Process a single file with preprocessing (conversion and splitting)."""
         if self._stop_event.is_set():
             item.status = FileQueueItem.STATUS_CANCELLED
             return
@@ -441,26 +813,106 @@ class ProcessingManager:
             item.progress = progress
             self._notify_update()
 
-        result = engine.transcribe(
-            item.file_path,
-            language=self.config.get("language", "auto"),
-            progress_callback=progress_cb
-        )
-
-        if self._stop_event.is_set():
-            item.status = FileQueueItem.STATUS_CANCELLED
-            return
-
-        if result["success"]:
+        try:
+            # Step 1: Preprocess the file (convert format, split if needed)
+            files_to_process = [item.file_path]
+            
+            if FFMPEG_AVAILABLE and self._preprocessor:
+                # Check if preprocessing is needed
+                needs_conversion = self._preprocessor.needs_conversion(item.file_path)
+                needs_splitting = self._preprocessor.needs_splitting(item.file_path)
+                
+                if needs_conversion or needs_splitting:
+                    item.status = FileQueueItem.STATUS_PREPROCESSING
+                    self._notify_update()
+                    
+                    logger.info(f"Preprocessing file: {item.file_name} (convert={needs_conversion}, split={needs_splitting})")
+                    
+                    files_to_process, item.was_preprocessed = self._preprocessor.preprocess(
+                        item.file_path,
+                        progress_callback=progress_cb
+                    )
+                    
+                    # Sort chunks to ensure correct order (part001, part002, etc.)
+                    files_to_process = sorted(files_to_process)
+                    
+                    item.chunk_count = len(files_to_process)
+                    logger.info(f"Preprocessing complete: {len(files_to_process)} file(s) to transcribe")
+                    
+                    # Log the files in order for debugging
+                    for i, f in enumerate(files_to_process):
+                        logger.debug(f"  Chunk {i+1}: {os.path.basename(f)}")
+            
+            # Step 2: Transcribe all files (original or chunks)
+            item.status = FileQueueItem.STATUS_PROCESSING
+            self._notify_update()
+            
+            all_transcriptions = []
+            total_duration = 0
+            
+            for idx, file_path in enumerate(files_to_process):
+                if self._stop_event.is_set():
+                    item.status = FileQueueItem.STATUS_CANCELLED
+                    return
+                
+                # Update progress for multiple chunks
+                if len(files_to_process) > 1:
+                    chunk_progress = 0.3 + (0.7 * idx / len(files_to_process))
+                    progress_cb(f"transcribing chunk {idx+1}/{len(files_to_process)}", chunk_progress)
+                    logger.info(f"Transcribing chunk {idx+1}/{len(files_to_process)}: {os.path.basename(file_path)}")
+                
+                result = engine.transcribe(
+                    file_path,
+                    language=self.config.get("language", "auto"),
+                    progress_callback=progress_cb if len(files_to_process) == 1 else None
+                )
+                
+                if result["success"]:
+                    transcription_preview = result["text"][:100] + "..." if len(result["text"]) > 100 else result["text"]
+                    logger.info(f"✓ Chunk {idx+1} transcribed: {len(result['text'])} chars, preview: {transcription_preview}")
+                    all_transcriptions.append(result["text"])
+                    total_duration += result.get("duration", 0)
+                    item.chunks_completed = idx + 1
+                else:
+                    # If any chunk fails, report the error
+                    logger.error(f"✗ Chunk {idx+1} failed: {result['error']}")
+                    if len(files_to_process) == 1:
+                        # Single file failure
+                        item.status = FileQueueItem.STATUS_ERROR
+                        item.error_message = result["error"] or "Unknown error"
+                        return
+                    else:
+                        # For multi-chunk, continue but note the error
+                        all_transcriptions.append(f"[Error in chunk {idx+1}: {result['error']}]")
+            
+            # Step 3: Combine transcriptions
+            if self._stop_event.is_set():
+                item.status = FileQueueItem.STATUS_CANCELLED
+                return
+            
+            # Join with space, but avoid double spaces from overlapping segments
+            combined_text = " ".join(all_transcriptions)
+            # Clean up potential issues from overlapping audio
+            combined_text = " ".join(combined_text.split())  # Normalize whitespace
+            
+            logger.info(f"Combined transcription: {len(combined_text)} total characters from {len(all_transcriptions)} chunk(s)")
+            
             item.status = FileQueueItem.STATUS_COMPLETE
-            item.result_text = result["text"]
-            item.duration = result.get("duration", 0)
-
+            item.result_text = combined_text
+            item.duration = total_duration
+            
             # Save the transcription
-            self._save_transcription(item, result["text"])
-        else:
+            self._save_transcription(item, combined_text)
+            
+            # Log savings if preprocessed
+            if item.was_preprocessed:
+                original_size_mb = item.file_size / (1024 * 1024)
+                logger.info(f"✓ Processed {item.file_name}: Original {original_size_mb:.1f}MB, {item.chunk_count} chunk(s)")
+                
+        except Exception as e:
+            logger.error(f"Error processing {item.file_name}: {e}", exc_info=True)
             item.status = FileQueueItem.STATUS_ERROR
-            item.error_message = result["error"] or "Unknown error"
+            item.error_message = str(e)[:100]
 
     def _save_transcription(self, item: FileQueueItem, text: str):
         """Save the transcription to a file."""
@@ -514,7 +966,7 @@ class ProcessingManager:
         completed = sum(1 for item in self.queue if item.status == FileQueueItem.STATUS_COMPLETE)
         errors = sum(1 for item in self.queue if item.status == FileQueueItem.STATUS_ERROR)
         pending = sum(1 for item in self.queue if item.status == FileQueueItem.STATUS_PENDING)
-        processing = sum(1 for item in self.queue if item.status == FileQueueItem.STATUS_PROCESSING)
+        processing = sum(1 for item in self.queue if item.status in (FileQueueItem.STATUS_PROCESSING, FileQueueItem.STATUS_PREPROCESSING))
 
         return {
             "total": total,
@@ -533,6 +985,7 @@ class FileListItem(ctk.CTkFrame):
 
     STATUS_COLORS = {
         FileQueueItem.STATUS_PENDING: COLORS["text_secondary"],
+        FileQueueItem.STATUS_PREPROCESSING: COLORS["warning"],
         FileQueueItem.STATUS_PROCESSING: COLORS["accent"],
         FileQueueItem.STATUS_COMPLETE: COLORS["success"],
         FileQueueItem.STATUS_ERROR: COLORS["error"],
@@ -541,7 +994,8 @@ class FileListItem(ctk.CTkFrame):
 
     STATUS_TEXT = {
         FileQueueItem.STATUS_PENDING: "Pending",
-        FileQueueItem.STATUS_PROCESSING: "Processing...",
+        FileQueueItem.STATUS_PREPROCESSING: "Converting...",
+        FileQueueItem.STATUS_PROCESSING: "Transcribing...",
         FileQueueItem.STATUS_COMPLETE: "Complete",
         FileQueueItem.STATUS_ERROR: "Error",
         FileQueueItem.STATUS_CANCELLED: "Cancelled",
@@ -621,9 +1075,20 @@ class FileListItem(ctk.CTkFrame):
 
         self.status_dot.configure(text_color=color)
 
-        # Show error message if available
+        # Build status text based on state
         if status == FileQueueItem.STATUS_ERROR and self.item.error_message:
             status_text = f"Error: {self.item.error_message[:30]}..."
+        elif status == FileQueueItem.STATUS_PREPROCESSING:
+            status_text = "Converting..."
+        elif status == FileQueueItem.STATUS_PROCESSING and self.item.chunk_count > 1:
+            # Show chunk progress for split files
+            status_text = f"Chunk {self.item.chunks_completed}/{self.item.chunk_count}"
+        elif status == FileQueueItem.STATUS_COMPLETE and self.item.was_preprocessed:
+            # Show that file was optimized
+            if self.item.chunk_count > 1:
+                status_text = f"✓ ({self.item.chunk_count} parts)"
+            else:
+                status_text = "✓ Optimized"
         else:
             status_text = self.STATUS_TEXT.get(status, "Unknown")
 
@@ -632,8 +1097,8 @@ class FileListItem(ctk.CTkFrame):
             text_color=color
         )
 
-        # Disable remove button while processing
-        if status == FileQueueItem.STATUS_PROCESSING:
+        # Disable remove button while processing or preprocessing
+        if status in (FileQueueItem.STATUS_PROCESSING, FileQueueItem.STATUS_PREPROCESSING):
             self.remove_btn.configure(state="disabled")
         else:
             self.remove_btn.configure(state="normal")
