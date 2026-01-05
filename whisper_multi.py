@@ -130,7 +130,9 @@ COLORS = {
 }
 
 # Formats that need conversion to MP3 for cost optimization
-FORMATS_TO_CONVERT = {".mp4", ".webm", ".mpeg", ".wav", ".flac", ".aiff", ".aif", ".wma"}
+# Now includes ALL formats for maximum API cost savings
+FORMATS_TO_CONVERT = {".mp4", ".webm", ".mpeg", ".wav", ".flac", ".aiff", ".aif", ".wma",
+                      ".mp3", ".m4a", ".ogg", ".oga", ".opus", ".aac", ".amr", ".3gp", ".3gpp", ".mpga"}
 
 # ============================================================================
 # AUDIO PREPROCESSOR
@@ -167,9 +169,23 @@ class AudioPreprocessor:
         logger.info(f"AudioPreprocessor initialized. Temp dir: {self.temp_dir}")
     
     def needs_conversion(self, file_path: str) -> bool:
-        """Check if a file needs format conversion."""
+        """
+        Check if a file needs format conversion.
+        Always convert to optimized MP3 (64kbps mono 16kHz) for:
+        - Maximum API cost savings
+        - Proper file size estimation for splitting
+        """
         ext = Path(file_path).suffix.lower()
-        return ext in FORMATS_TO_CONVERT
+        # Always convert all supported formats for cost optimization
+        if ext in FORMATS_TO_CONVERT:
+            return True
+        # Also convert any file larger than 5MB (likely not optimized)
+        try:
+            if os.path.getsize(file_path) > 5 * 1024 * 1024:
+                return True
+        except OSError:
+            pass
+        return False
     
     def needs_splitting(self, file_path: str) -> bool:
         """Check if a file needs to be split due to size."""
@@ -400,39 +416,65 @@ class AudioPreprocessor:
         return chunks
     
     def preprocess(
-        self, 
-        file_path: str, 
+        self,
+        file_path: str,
         progress_callback: Optional[Callable] = None
     ) -> Tuple[List[str], bool]:
         """
-        Preprocess an audio file: convert and/or split as needed.
-        
+        Preprocess an audio file: ALWAYS convert to optimized MP3 and split if needed.
+
+        This ensures:
+        1. All files are converted to 64kbps mono 16kHz MP3 for cost savings
+        2. Large files are properly split based on CONVERTED file size
+        3. Chunks are correctly named for sequential ordering
+
         Args:
             file_path: Path to the input file
             progress_callback: Optional callback for progress updates
-            
+
         Returns:
             Tuple of (list of file paths to process, whether preprocessing was done)
         """
         if not FFMPEG_AVAILABLE:
+            logger.warning("FFmpeg not available - cannot preprocess file. Large files may fail!")
             return [file_path], False
-        
-        processed_path = file_path
-        was_processed = False
-        
-        # Step 1: Convert if needed
-        if self.needs_conversion(file_path):
-            logger.info(f"File needs conversion: {file_path}")
-            processed_path = self.convert_to_optimized_mp3(file_path, progress_callback)
-            was_processed = True
-        
-        # Step 2: Check if splitting is needed (after conversion)
+
+        original_size = os.path.getsize(file_path)
+        logger.info(f"Preprocessing: {file_path} (Original size: {original_size / 1024 / 1024:.1f}MB)")
+
+        # Step 1: ALWAYS convert to optimized MP3 for API cost savings
+        # This converts ANY audio to 64kbps mono 16kHz - much cheaper with the API
+        logger.info(f"Converting to optimized MP3 (64kbps mono 16kHz)...")
+        if progress_callback:
+            progress_callback("converting", 0.05)
+
+        processed_path = self.convert_to_optimized_mp3(file_path, progress_callback)
+        converted_size = os.path.getsize(processed_path)
+
+        logger.info(f"Conversion complete: {original_size / 1024 / 1024:.1f}MB -> {converted_size / 1024 / 1024:.1f}MB "
+                    f"({(1 - converted_size / original_size) * 100:.1f}% reduction)")
+
+        # Step 2: Check if splitting is needed AFTER conversion
+        # Now using the converted file size for accurate chunk calculation
         if self.needs_splitting(processed_path):
-            logger.info(f"File needs splitting: {processed_path}")
+            logger.info(f"File still needs splitting after conversion ({converted_size / 1024 / 1024:.1f}MB > 24MB)")
+            if progress_callback:
+                progress_callback("splitting", 0.2)
+
             chunks = self.split_audio(processed_path, progress_callback)
+
+            # Verify chunks are properly named and sorted
+            chunks = sorted(chunks)  # Ensure alphabetical order: part001, part002, etc.
+
+            logger.info(f"Splitting complete: {len(chunks)} chunks created")
+            for i, chunk in enumerate(chunks):
+                chunk_size = os.path.getsize(chunk) if os.path.exists(chunk) else 0
+                logger.info(f"  Chunk {i+1}: {os.path.basename(chunk)} ({chunk_size / 1024:.1f}KB)")
+
             return chunks, True
-        
-        return [processed_path], was_processed
+
+        logger.info(f"No splitting needed - file is under 24MB after conversion")
+        return [processed_path], True
     
     def cleanup(self):
         """Remove all temporary files created during preprocessing."""
@@ -814,34 +856,39 @@ class ProcessingManager:
             self._notify_update()
 
         try:
-            # Step 1: Preprocess the file (convert format, split if needed)
+            # Step 1: ALWAYS preprocess the file for cost optimization
+            # Converts to 64kbps mono MP3 and splits if > 24MB
             files_to_process = [item.file_path]
-            
+
             if FFMPEG_AVAILABLE and self._preprocessor:
-                # Check if preprocessing is needed
-                needs_conversion = self._preprocessor.needs_conversion(item.file_path)
-                needs_splitting = self._preprocessor.needs_splitting(item.file_path)
-                
-                if needs_conversion or needs_splitting:
-                    item.status = FileQueueItem.STATUS_PREPROCESSING
-                    self._notify_update()
-                    
-                    logger.info(f"Preprocessing file: {item.file_name} (convert={needs_conversion}, split={needs_splitting})")
-                    
-                    files_to_process, item.was_preprocessed = self._preprocessor.preprocess(
-                        item.file_path,
-                        progress_callback=progress_cb
-                    )
-                    
-                    # Sort chunks to ensure correct order (part001, part002, etc.)
-                    files_to_process = sorted(files_to_process)
-                    
-                    item.chunk_count = len(files_to_process)
-                    logger.info(f"Preprocessing complete: {len(files_to_process)} file(s) to transcribe")
-                    
-                    # Log the files in order for debugging
-                    for i, f in enumerate(files_to_process):
-                        logger.debug(f"  Chunk {i+1}: {os.path.basename(f)}")
+                # ALWAYS preprocess for API cost savings (64kbps mono is much cheaper)
+                item.status = FileQueueItem.STATUS_PREPROCESSING
+                self._notify_update()
+
+                original_size_mb = item.file_size / (1024 * 1024)
+                logger.info(f"Preprocessing file: {item.file_name} ({original_size_mb:.1f}MB)")
+
+                files_to_process, item.was_preprocessed = self._preprocessor.preprocess(
+                    item.file_path,
+                    progress_callback=progress_cb
+                )
+
+                # Sort chunks to ensure STRICT sequential order (part001, part002, etc.)
+                files_to_process = sorted(files_to_process)
+
+                item.chunk_count = len(files_to_process)
+                logger.info(f"Preprocessing complete: {len(files_to_process)} file(s) to transcribe in order")
+
+                # Log the files in order for debugging - IMPORTANT for text ordering
+                for i, f in enumerate(files_to_process):
+                    logger.info(f"  Chunk {i+1}/{len(files_to_process)}: {os.path.basename(f)}")
+            else:
+                # FFmpeg not available - warn user about large files
+                if item.file_size > 25 * 1024 * 1024:
+                    logger.error(f"FFmpeg not available and file is too large ({item.file_size / 1024 / 1024:.1f}MB > 25MB)")
+                    item.status = FileQueueItem.STATUS_ERROR
+                    item.error_message = "FFmpeg required for large files. Install FFmpeg."
+                    return
             
             # Step 2: Transcribe all files (original or chunks)
             item.status = FileQueueItem.STATUS_PROCESSING
@@ -885,17 +932,25 @@ class ProcessingManager:
                         # For multi-chunk, continue but note the error
                         all_transcriptions.append(f"[Error in chunk {idx+1}: {result['error']}]")
             
-            # Step 3: Combine transcriptions
+            # Step 3: Combine transcriptions IN SEQUENTIAL ORDER
+            # IMPORTANT: all_transcriptions list is built in order (chunk 1, 2, 3...)
+            # because we iterate through sorted files_to_process sequentially
             if self._stop_event.is_set():
                 item.status = FileQueueItem.STATUS_CANCELLED
                 return
-            
-            # Join with space, but avoid double spaces from overlapping segments
+
+            if len(all_transcriptions) > 1:
+                logger.info(f"Combining {len(all_transcriptions)} chunks in sequential order...")
+                for i, text in enumerate(all_transcriptions):
+                    preview = text[:50].replace('\n', ' ') + "..." if len(text) > 50 else text.replace('\n', ' ')
+                    logger.info(f"  Chunk {i+1} starts with: '{preview}'")
+
+            # Join with space, maintaining strict order from chunk 1 to N
             combined_text = " ".join(all_transcriptions)
-            # Clean up potential issues from overlapping audio
-            combined_text = " ".join(combined_text.split())  # Normalize whitespace
-            
-            logger.info(f"Combined transcription: {len(combined_text)} total characters from {len(all_transcriptions)} chunk(s)")
+            # Clean up potential issues from overlapping audio (normalize whitespace)
+            combined_text = " ".join(combined_text.split())
+
+            logger.info(f"Combined transcription: {len(combined_text)} total characters from {len(all_transcriptions)} chunk(s) in order")
             
             item.status = FileQueueItem.STATUS_COMPLETE
             item.result_text = combined_text
@@ -1138,7 +1193,7 @@ class WhisperTranscriptor(BaseApp):
         self.processing_manager.completion_callback = self._on_processing_complete
 
         # Window setup
-        self.title("Ultra Whisper Transcriptor")
+        self.title("Ultra Whisper V3 BIG")
         self.geometry("900x700")
         self.minsize(700, 500)
 
@@ -1197,7 +1252,7 @@ class WhisperTranscriptor(BaseApp):
 
         ctk.CTkLabel(
             title_frame,
-            text=" TRANSCRIPTOR",
+            text=" V3 BIG",
             font=ctk.CTkFont(size=24, weight="bold"),
             text_color=COLORS["text"],
         ).pack(side="left")
