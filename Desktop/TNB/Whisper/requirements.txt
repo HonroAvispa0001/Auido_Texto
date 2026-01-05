@@ -1,0 +1,11 @@
+# Ultra Whisper Transcriptor - Requirements
+# Install with: pip install -r requirements.txt
+
+# Core dependencies
+openai>=1.0.0
+customtkinter>=5.2.0
+
+# Drag and drop support (optional, app works without it)
+tkinterdnd2>=0.3.0
+
+# Note: tkinter comes with Python installation
